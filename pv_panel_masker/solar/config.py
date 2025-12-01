@@ -6,6 +6,7 @@ class PanelMaskerConfig:
     # SAM Settings
     text_prompt: str = "panel"
     confidence_threshold: float = 0.2
+    batch_size: int = 2
     
     # Stage 1: Individual Panel Filtering
     indiv_min_width: float = 60.0

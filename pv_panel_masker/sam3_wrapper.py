@@ -12,6 +12,49 @@ from sam3.model.sam3_image_processor import Sam3Processor
 from sam3.model.box_ops import box_xywh_to_cxcywh
 from sam3.visualization_utils import normalize_bbox
 
+import torch
+import numpy as np
+from PIL import Image
+from typing import List, Dict, Optional, Union, Any
+
+# SAM3 Specific Imports
+from sam3.train.data.sam3_image_dataset import InferenceMetadata, FindQueryLoaded, Image as SAMImage, Datapoint
+from sam3.model.utils.misc import copy_data_to_device
+from sam3.train.data.collator import collate_fn_api as collate
+from sam3.train.transforms.basic_for_api import ComposeAPI, RandomResizeAPI, ToTensorAPI, NormalizeAPI
+from sam3.eval.postprocessors import PostProcessImage
+
+# --- Helper Functions (Integrated from your snippet) ---
+# We keep these outside the class or static to avoid self-reference issues during datapoint creation
+def _create_datapoint_for_image(pil_image: Image.Image, text_prompt: str, unique_id: int):
+    """Creates a SAM3 Datapoint for a single image with a text prompt."""
+    w, h = pil_image.size
+    
+    # 1. Create Datapoint & Set Image
+    dp = Datapoint(find_queries=[], images=[])
+    dp.images = [SAMImage(data=pil_image, objects=[], size=[h, w])]
+    
+    # 2. Add Text Prompt
+    dp.find_queries.append(
+        FindQueryLoaded(
+            query_text=text_prompt,
+            image_id=0,
+            object_ids_output=[],
+            is_exhaustive=True,
+            query_processing_order=0,
+            inference_metadata=InferenceMetadata(
+                coco_image_id=unique_id,
+                original_image_id=unique_id,
+                original_category_id=1,
+                original_size=[w, h],
+                object_id=0,
+                frame_index=0,
+            )
+        )
+    )
+    return dp
+
+
 
 class SAM3Wrapper:
     """
@@ -87,6 +130,25 @@ class SAM3Wrapper:
         
         self.current_image = None
         self.inference_state = None
+        
+        self.transform = ComposeAPI(
+            transforms=[
+                RandomResizeAPI(sizes=resolution, max_size=resolution, square=True, consistent_transform=False),
+                ToTensorAPI(),
+                NormalizeAPI(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ]
+        )
+        
+        self.postprocessor = PostProcessImage(
+            max_dets_per_img=-1,       # if this number is positive, the processor will return topk. For this demo we instead limit by confidence, see below
+            iou_type="segm",           # we want masks
+            use_original_sizes_box=True,   # our boxes should be resized to the image size
+            use_original_sizes_mask=True,   # our masks should be resized to the image size
+            convert_mask_to_rle=False, # the postprocessor supports efficient conversion to RLE format. In this demo we prefer the binary format for easy plotting
+            detection_threshold=confidence_threshold,   # Only return confident detections
+            to_cpu=False,
+        )
+    
     
     def set_image(self, image: Union[str, Image.Image, np.ndarray]) -> None:
         """
@@ -185,6 +247,68 @@ class SAM3Wrapper:
             'boxes': self.inference_state['boxes'],
             'scores': self.inference_state['scores']
         }
+    
+    def segment_batch(self, images: List[Image.Image], text_prompt: str) -> List[Dict[str, torch.Tensor]]:
+        """
+        Segment a batch of images using the same text prompt.
+        
+        Args:
+            images: List of PIL Images.
+            text_prompt: The text prompt to apply to all images.
+            
+        Returns:
+            List of dictionaries (one per image), each containing:
+            - 'boxes': [N, 4]
+            - 'masks': [N, H, W]
+            - 'scores': [N]
+        """
+        if not images:
+            return []
+
+        # 1. Prepare Datapoints
+        datapoints = []
+        for i, img in enumerate(images):
+            # Create raw datapoint
+            dp = _create_datapoint_for_image(img, text_prompt, unique_id=i+1)
+            # Apply transforms (resize, normalize, etc.)
+            # Assuming self.transform is available from the model loading stage
+            dp = self.transform(dp) 
+            datapoints.append(dp)
+
+        # 2. Collate & Move to GPU
+        # The dict_key="dummy" is standard for SAM3 inference collator
+        batch = collate(datapoints, dict_key="dummy")["dummy"]
+        batch = copy_data_to_device(batch, self.device, non_blocking=True)
+
+        # 3. Inference
+        with torch.no_grad():
+            output = self.model(batch)
+        
+        # 4. Post-processing
+        # process_results returns a list of results corresponding to input batch
+        processed_results = self.postprocessor.process_results(output, batch.find_metadatas)
+
+        # 5. Format Output
+        formatted_results = []
+        for key, res in processed_results.items():            
+            # Masks: [N, H, W]
+            masks = res.get('masks', res.get('pred_masks'))
+            if isinstance(masks, torch.Tensor):
+                masks = masks.squeeze(1) if masks.dim() == 4 else masks
+            
+            # Boxes: [N, 4]
+            boxes = res.get('boxes', res.get('pred_boxes'))
+            
+            # Scores: [N]
+            scores = res.get('scores', res.get('iou_scores', res.get('pred_logits')))
+
+            formatted_results.append({
+                'boxes': boxes,
+                'masks': masks,
+                'scores': scores
+            })
+
+        return formatted_results
     
     def _normalize_box(
         self,

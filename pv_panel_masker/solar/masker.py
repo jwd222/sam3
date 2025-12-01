@@ -3,6 +3,7 @@ import numpy as np
 from PIL import Image
 from typing import Dict, Any, List
 import logging
+from pathlib import Path
 
 # Internal imports
 from .utils.visualization import PanelVisualizer
@@ -263,3 +264,69 @@ class PanelMasker:
                 final_masks.append(torch.stack(list(comp_masks)).any(dim=0))
                 
         return final_boxes, final_masks
+    
+    def process_batch(self, image_paths: List[str]) -> List[Dict[str, Any]]:
+        """
+        Process a list of images in a batch.
+        1. Loads all images.
+        2. Runs SAM inference in batch (GPU efficient).
+        3. Runs post-processing (Stages 1-4) sequentially.
+        """
+        # 1. Load Images
+        valid_paths = []
+        pil_images = []
+        for p in image_paths:
+            try:
+                img = Image.open(p).convert('RGB')
+                pil_images.append(img)
+                valid_paths.append(p)
+            except Exception as e:
+                logger.error(f"Failed to load image for batch: {p} - {e}")
+        
+        if not pil_images:
+            return []
+
+        logger.info(f"Running Batch Inference on {len(pil_images)} images...")
+        
+        # 2. Batch Inference
+        self.sam.set_confidence_threshold(self.cfg.confidence_threshold)
+        batch_results = self.sam.segment_batch(pil_images, text_prompt=self.cfg.text_prompt)
+        
+        final_states = []
+
+        # 3. Sequential Post-processing
+        for idx, result in enumerate(batch_results):
+            current_path = valid_paths[idx]
+            current_img = pil_images[idx]
+            current_img_array = np.array(current_img)
+            
+            # Reset state for this specific image
+            self.reset_state()
+            self.state['image_path'] = current_path
+            self.state['image_shape'] = current_img.size[::-1] # H, W
+            
+            # Populate Raw Data
+            raw_boxes = result['boxes']
+            raw_masks = result['masks']
+            raw_scores = result['scores']
+            
+            self.state.update({'raw_boxes': raw_boxes, 'raw_masks': raw_masks, 'raw_scores': raw_scores})
+            
+            # Run Stages 1-4 (Reusing your existing internal logic)
+            if len(raw_boxes) > 0:
+                s1_boxes, s1_masks, s1_scores = self._stage1_individual_panels(raw_boxes, raw_masks, raw_scores, current_img_array)
+                self.state.update({'stage1_boxes': s1_boxes, 'stage1_masks': s1_masks})
+
+                s2_boxes, s2_masks, s2_scores = self._stage2_large_objects(raw_boxes, raw_masks, raw_scores, current_img_array)
+                self.state.update({'stage2_boxes': s2_boxes, 'stage2_masks': s2_masks})
+
+                s3_boxes, s3_masks, s3_scores, reasons = self._stage3_validation(s2_boxes, s2_masks, s2_scores, current_img_array)
+                self.state.update({'stage3_boxes': s3_boxes, 'stage3_masks': s3_masks, 'validation_reasons': reasons})
+
+                final_boxes, final_masks = self._stage4_merging(s1_boxes, s1_masks, s3_boxes, s3_masks)
+                self.state.update({'final_boxes': final_boxes, 'final_masks': final_masks})
+            
+            logger.debug(f"Finished processing {Path(current_path).name}: {len(self.state['final_boxes'])} panels.")
+            final_states.append(self.state.copy())
+
+        return final_states
