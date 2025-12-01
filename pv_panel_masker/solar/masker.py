@@ -1,7 +1,8 @@
 import torch
 import numpy as np
 from PIL import Image
-from typing import Dict, Any
+from typing import Dict, Any, List
+import logging
 
 # Internal imports
 from .utils.visualization import PanelVisualizer
@@ -10,14 +11,11 @@ from .config import PanelMaskerConfig
 from .utils.features import FeatureUtils
 from .utils.geometry import BoxUtils
 
-# ============================================================================
-# MAIN CLASS: PANEL MASKER
-# ============================================================================
+logger = logging.getLogger("solar_masker.core")
 
 class PanelMasker:
     """
     Main class for Solar Panel Segmentation.
-    Stores intermediate results in `self.state` for introspection.
     """
     
     def __init__(self, sam_wrapper, config: PanelMaskerConfig = PanelMaskerConfig()):
@@ -26,6 +24,7 @@ class PanelMasker:
         self.state = {} # Stores intermediate results of the last run
         self.panel_visualizer = PanelVisualizer()
         self.panel_io = PanelIO()
+        logger.debug(f"PanelMasker initialized with config: {self.cfg}")
         
     def reset_state(self):
         """Clear intermediate results."""
@@ -48,15 +47,20 @@ class PanelMasker:
         Populates self.state with all intermediate and final results.
         """
         self.reset_state()
-        print(f"\nProcessing: {image_path}")
+        logger.info(f"Processing: {image_path}")
         self.state['image_path'] = image_path
         
         # Load Image
-        image = Image.open(image_path).convert('RGB')
-        image_array = np.array(image)
-        self.state['image_shape'] = image.size[::-1] # H, W
+        try:
+            image = Image.open(image_path).convert('RGB')
+            image_array = np.array(image)
+            self.state['image_shape'] = image.size[::-1] # H, W
+        except Exception as e:
+            logger.error(f"Failed to load image {image_path}: {e}")
+            return self.state
         
         # 0. SAM Inference
+        logger.debug("Running SAM inference...")
         self.sam.set_confidence_threshold(self.cfg.confidence_threshold)
         results = self.sam.segment(image=image, text=self.cfg.text_prompt)
         
@@ -71,7 +75,7 @@ class PanelMasker:
         })
         
         if len(raw_boxes) == 0:
-            print("  No detections found.")
+            logger.info("No initial detections found.")
             return self.state
 
         # 1. Stage 1: Individual Panels
@@ -114,12 +118,10 @@ class PanelMasker:
             'final_masks': final_masks
         })
         
-        print(f"  Final: {len(final_boxes)} panels merged.")
+        logger.info(f"Final Result: {len(final_boxes)} panels merged.")
         return self.state
 
-    # ------------------------------------------------------------------------
-    # Internal Stage Methods
-    # ------------------------------------------------------------------------
+    # --- Internal Stages ---
 
     def _stage1_individual_panels(self, boxes, masks, scores, image_array):
         if len(boxes) == 0: return boxes, masks, scores
@@ -146,11 +148,12 @@ class PanelMasker:
         
         for i in range(len(boxes)):
             if not size_mask[i]: continue
-            
             mean_intensity = FeatureUtils.calculate_mean_intensity(image_gray, masks[i].cpu().numpy())
             if mean_intensity >= self.cfg.indiv_min_intensity:
                 valid_indices.append(i)
                 
+        logger.debug(f"Stage 1: {len(valid_indices)}/{len(boxes)} passed size & intensity checks.")
+        
         if not valid_indices:
             return torch.tensor([]).to(boxes.device), torch.tensor([]).to(boxes.device), torch.tensor([]).to(boxes.device)
             
@@ -170,11 +173,12 @@ class PanelMasker:
         
         for i in range(len(boxes)):
             if not size_mask[i]: continue
-            
             mean_intensity = FeatureUtils.calculate_mean_intensity(image_gray, masks[i].cpu().numpy())
             if mean_intensity >= self.cfg.large_min_intensity:
                 valid_indices.append(i)
 
+        logger.debug(f"Stage 2: {len(valid_indices)} large objects identified.")
+        
         if not valid_indices:
             return torch.tensor([]).to(boxes.device), torch.tensor([]).to(boxes.device), torch.tensor([]).to(boxes.device)
 
@@ -191,8 +195,6 @@ class PanelMasker:
         for i in range(len(boxes)):
             mask_np = masks[i].cpu().numpy()
             mean_intensity = FeatureUtils.calculate_mean_intensity(image_gray, mask_np)
-            
-            # Heuristics
             is_valid = False
             reasons = []
             
@@ -201,20 +203,20 @@ class PanelMasker:
                 reasons.append(f"High Intensity ({mean_intensity:.2f})")
             elif mean_intensity >= self.cfg.val_intensity_medium:
                 checks = 0
-                edge_den = FeatureUtils.calculate_edge_density(image_gray, mask_np)
-                comps = FeatureUtils.count_mask_components(mask_np)
-                
-                if comps >= self.cfg.val_min_components: checks += 1
-                if edge_den >= self.cfg.val_edge_density: checks += 1
+                if FeatureUtils.count_mask_components(mask_np) >= self.cfg.val_min_components: checks += 1
+                if FeatureUtils.calculate_edge_density(image_gray, mask_np) >= self.cfg.val_edge_density: checks += 1
                 if FeatureUtils.check_grid_pattern(mask_np): checks += 1
                 
                 if checks >= 2:
                     is_valid = True
-                    reasons.append("Medium Intensity + Structure")
+                    reasons.append(f"Medium Intensity + Structure ({checks} checks passed)")
             
             if is_valid:
                 valid_indices.append(i)
                 reasons_log.append(" | ".join(reasons))
+                logger.debug(f"Stage 3: Validated Object {i}: {' | '.join(reasons)}")
+            else:
+                logger.debug(f"Stage 3: Rejected Object {i} (Intensity: {mean_intensity:.2f})")
                 
         if not valid_indices:
             return torch.tensor([]).to(boxes.device), torch.tensor([]).to(boxes.device), torch.tensor([]).to(boxes.device), []
@@ -234,7 +236,8 @@ class PanelMasker:
         all_boxes = torch.cat(tensors_to_cat_box, dim=0)
         all_masks = torch.cat(tensors_to_cat_mask, dim=0)
         
-        # Connected Components
+        logger.debug(f"Stage 4: Merging {len(all_boxes)} total detections.")
+        
         component_indices = BoxUtils.merge_connected_components(all_boxes, self.cfg.merge_iou_threshold)
         
         final_boxes = []
@@ -260,4 +263,3 @@ class PanelMasker:
                 final_masks.append(torch.stack(list(comp_masks)).any(dim=0))
                 
         return final_boxes, final_masks
-
