@@ -1309,7 +1309,7 @@ if __name__ == "__main__":
     
     result = process_single_image(
         sam_wrapper=sam,
-        image_path="/mnt/d/S/ANTS/Data/spectra_thermal/132FTASK_1761021720/IRX_4561.JPG", # "D:\S\ANTS\Data\spectra_thermal\132FTASK_1761021720\IRX_4552.JPG"
+        image_path="/mnt/d/S/ANTS/Data/spectra_thermal/132FTASK_1761021720/IRX_4570.JPG", # "D:\S\ANTS\Data\spectra_thermal\132FTASK_1761021720\IRX_4552.JPG"
         confidence_threshold=CONFIDENCE_THRESHOLD,
         # Stage 1: Individual panels (strict)
         individual_panel_max_width=80.0,
